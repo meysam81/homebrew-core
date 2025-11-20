@@ -2,9 +2,9 @@ class Php < Formula
   desc "General-purpose scripting language"
   homepage "https://www.php.net/"
   # Should only be updated if the new version is announced on the homepage, https://www.php.net/
-  url "https://www.php.net/distributions/php-8.4.15.tar.xz"
-  mirror "https://fossies.org/linux/www/php-8.4.15.tar.xz"
-  sha256 "a060684f614b8344f9b34c334b6ba8db1177555997edb5b1aceab0a4b807da7e"
+  url "https://www.php.net/distributions/php-8.5.0.tar.xz"
+  mirror "https://fossies.org/linux/www/php-8.5.0.tar.xz"
+  sha256 "39cb6e4acd679b574d3d3276f148213e935fc25f90403eb84fb1b836a806ef1e"
   license "PHP-3.01"
 
   livecheck do
@@ -59,14 +59,7 @@ class Php < Formula
   uses_from_macos "zlib"
 
   on_macos do
-    depends_on "gcc" => :build # must never be a runtime dependency
     depends_on "gettext"
-  end
-
-  # https://github.com/Homebrew/homebrew-core/issues/235820
-  # https://clang.llvm.org/docs/UsersManual.html#gcc-extensions-not-implemented-yet
-  fails_with :clang do
-    cause "Performs worse due to lack of general global register variables"
   end
 
   def install
@@ -79,6 +72,14 @@ class Php < Formula
               "APXS_LIBEXECDIR='$(INSTALL_ROOT)#{lib}/httpd/modules'"
       s.gsub! "-z $($APXS -q SYSCONFDIR)",
               "-z ''"
+
+      # NOTE: `versioned_formula?` conditionals are to make sure correct changes
+      # are applied if copied from `php`. Remove dead code when creating `php@x.y`
+      if versioned_formula?
+        # apxs will interpolate the @ in the versioned prefix: https://bz.apache.org/bugzilla/show_bug.cgi?id=61944
+        s.gsub! "LIBEXECDIR='$APXS_LIBEXECDIR'",
+                "LIBEXECDIR='" + "#{lib}/httpd/modules".gsub("\\", "\\\\").gsub("@", "\\@") + "'"
+      end
     end
 
     # Update error message in apache sapi to better explain the requirements
@@ -105,17 +106,21 @@ class Php < Formula
     ENV["PHP_BUILD_PROVIDER"] = tap.user
 
     if OS.mac?
-      ENV["SASL_CFLAGS"] = "-I#{MacOS.sdk_path_if_needed}/usr/include/sasl"
+      sdk_path = MacOS.sdk_for_formula(self).path
+      ENV["SASL_CFLAGS"] = "-I#{sdk_path}/usr/include/sasl"
       ENV["SASL_LIBS"] = "-lsasl2"
+
+      # Each extension needs a direct reference to the sdk path or it won't find the headers
+      headers_path = "=#{sdk_path}/usr"
+
+      # PHP build system incorrectly links system libraries: https://github.com/php/php-src/issues/10680
+      # Homebrew's superenv can only discard these if using realpath of SDK
+      ENV["HOMEBREW_SDKROOT"] = sdk_path.realpath
     else
       ENV["SQLITE_CFLAGS"] = "-I#{Formula["sqlite"].opt_include}"
       ENV["SQLITE_LIBS"] = "-lsqlite3"
       ENV["BZIP_DIR"] = Formula["bzip2"].opt_prefix
     end
-
-    # Each extension that is built on Mojave needs a direct reference to the
-    # sdk path or it won't find the headers
-    headers_path = "=#{MacOS.sdk_path_if_needed}/usr" if OS.mac?
 
     # `_www` only exists on macOS.
     fpm_user = OS.mac? ? "_www" : "www-data"
@@ -260,11 +265,11 @@ class Php < Formula
     ln_s pecl_path, prefix/"pecl" unless (prefix/"pecl").exist?
     extension_dir = Utils.safe_popen_read(bin/"php-config", "--extension-dir").chomp
     php_basename = File.basename(extension_dir)
-    php_ext_dir = opt_prefix/"lib/php"/php_basename
     (pecl_path/php_basename).mkpath
 
     # fix pear config to install outside cellar
-    pear_path = HOMEBREW_PREFIX/"share/pear"
+    pear_dir = versioned_formula? ? "pear@#{version.major_minor}" : "pear"
+    pear_path = HOMEBREW_PREFIX/"share"/pear_dir
     cp_r pkgshare/"pear/.", pear_path
     {
       "php_ini"  => etc/"php/#{version.major_minor}/php.ini",
@@ -284,22 +289,6 @@ class Php < Formula
     end
 
     system bin/"pear", "update-channels"
-
-    %w[
-      opcache
-    ].each do |e|
-      ext_config_path = etc/"php/#{version.major_minor}/conf.d/ext-#{e}.ini"
-      extension_type = (e == "opcache") ? "zend_extension" : "extension"
-      if ext_config_path.exist?
-        inreplace ext_config_path,
-          /#{extension_type}=.*$/, "#{extension_type}=#{php_ext_dir}/#{e}.so"
-      else
-        ext_config_path.write <<~INI
-          [#{e}]
-          #{extension_type}="#{php_ext_dir}/#{e}.so"
-        INI
-      end
-    end
   end
 
   def caveats
@@ -330,73 +319,74 @@ class Php < Formula
   end
 
   test do
-    assert_match(/^Zend OPcache$/, shell_output("#{bin}/php -i"),
-      "Zend OPCache extension not loaded")
-    # Test related to libxml2 and
-    # https://github.com/Homebrew/homebrew-core/issues/28398
-    assert_includes (bin/"php").dynamically_linked_libraries,
-                    (Formula["libpq"].opt_lib/shared_library("libpq", 5)).to_s
+    assert_match(/^Zend OPcache$/, shell_output("#{bin}/php -i"), "Zend OPCache extension not loaded")
 
-    system "#{sbin}/php-fpm", "-t"
+    # Test related to libxml2 and https://github.com/Homebrew/homebrew-core/issues/28398
+    require "utils/linkage"
+    libpq = Formula["libpq"].opt_lib/shared_library("libpq")
+    assert Utils.binary_linked_to_library?(bin/"php", libpq), "No linkage with Homebrew #{libpq.basename}!"
+
+    system sbin/"php-fpm", "-t"
     system bin/"phpdbg", "-V"
     system bin/"php-cgi", "-m"
 
+    port = free_port
+    port_fpm = free_port
+    expected_output = /^Hello world!$/
+
+    (testpath/"index.php").write <<~PHP
+      <?php
+      echo 'Hello world!' . PHP_EOL;
+      var_dump(ldap_connect());
+      $session = new SNMP(SNMP::VERSION_1, '127.0.0.1', 'public');
+      var_dump(@$session->get('sysDescr.0'));
+    PHP
+
+    main_config = <<~EOS
+      Listen #{port}
+      ServerName localhost:#{port}
+      DocumentRoot "#{testpath}"
+      ErrorLog "#{testpath}/httpd-error.log"
+      ServerRoot "#{Formula["httpd"].opt_prefix}"
+      PidFile "#{testpath}/httpd.pid"
+      LoadModule authz_core_module lib/httpd/modules/mod_authz_core.so
+      LoadModule unixd_module lib/httpd/modules/mod_unixd.so
+      LoadModule dir_module lib/httpd/modules/mod_dir.so
+      DirectoryIndex index.php
+    EOS
+
+    (testpath/"httpd.conf").write <<~EOS
+      #{main_config}
+      LoadModule mpm_prefork_module lib/httpd/modules/mod_mpm_prefork.so
+      LoadModule php_module #{lib}/httpd/modules/libphp.so
+      <FilesMatch \\.(php|phar)$>
+        SetHandler application/x-httpd-php
+      </FilesMatch>
+    EOS
+
+    (testpath/"fpm.conf").write <<~INI
+      [global]
+      daemonize=no
+      [www]
+      listen = 127.0.0.1:#{port_fpm}
+      pm = dynamic
+      pm.max_children = 5
+      pm.start_servers = 2
+      pm.min_spare_servers = 1
+      pm.max_spare_servers = 3
+    INI
+
+    (testpath/"httpd-fpm.conf").write <<~EOS
+      #{main_config}
+      LoadModule mpm_event_module lib/httpd/modules/mod_mpm_event.so
+      LoadModule proxy_module lib/httpd/modules/mod_proxy.so
+      LoadModule proxy_fcgi_module lib/httpd/modules/mod_proxy_fcgi.so
+      <FilesMatch \\.(php|phar)$>
+        SetHandler "proxy:fcgi://127.0.0.1:#{port_fpm}"
+      </FilesMatch>
+    EOS
+
     begin
-      port = free_port
-      port_fpm = free_port
-
-      expected_output = /^Hello world!$/
-      (testpath/"index.php").write <<~PHP
-        <?php
-        echo 'Hello world!' . PHP_EOL;
-        var_dump(ldap_connect());
-        $session = new SNMP(SNMP::VERSION_1, '127.0.0.1', 'public');
-        var_dump(@$session->get('sysDescr.0'));
-      PHP
-      main_config = <<~EOS
-        Listen #{port}
-        ServerName localhost:#{port}
-        DocumentRoot "#{testpath}"
-        ErrorLog "#{testpath}/httpd-error.log"
-        ServerRoot "#{Formula["httpd"].opt_prefix}"
-        PidFile "#{testpath}/httpd.pid"
-        LoadModule authz_core_module lib/httpd/modules/mod_authz_core.so
-        LoadModule unixd_module lib/httpd/modules/mod_unixd.so
-        LoadModule dir_module lib/httpd/modules/mod_dir.so
-        DirectoryIndex index.php
-      EOS
-
-      (testpath/"httpd.conf").write <<~EOS
-        #{main_config}
-        LoadModule mpm_prefork_module lib/httpd/modules/mod_mpm_prefork.so
-        LoadModule php_module #{lib}/httpd/modules/libphp.so
-        <FilesMatch \\.(php|phar)$>
-          SetHandler application/x-httpd-php
-        </FilesMatch>
-      EOS
-
-      (testpath/"fpm.conf").write <<~INI
-        [global]
-        daemonize=no
-        [www]
-        listen = 127.0.0.1:#{port_fpm}
-        pm = dynamic
-        pm.max_children = 5
-        pm.start_servers = 2
-        pm.min_spare_servers = 1
-        pm.max_spare_servers = 3
-      INI
-
-      (testpath/"httpd-fpm.conf").write <<~EOS
-        #{main_config}
-        LoadModule mpm_event_module lib/httpd/modules/mod_mpm_event.so
-        LoadModule proxy_module lib/httpd/modules/mod_proxy.so
-        LoadModule proxy_fcgi_module lib/httpd/modules/mod_proxy_fcgi.so
-        <FilesMatch \\.(php|phar)$>
-          SetHandler "proxy:fcgi://127.0.0.1:#{port_fpm}"
-        </FilesMatch>
-      EOS
-
       pid = spawn Formula["httpd"].opt_bin/"httpd", "-X", "-f", "#{testpath}/httpd.conf"
       sleep 10
       assert_match expected_output, shell_output("curl -s 127.0.0.1:#{port}")
