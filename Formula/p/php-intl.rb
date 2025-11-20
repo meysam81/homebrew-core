@@ -1,9 +1,9 @@
 class PhpIntl < Formula
   desc "PHP internationalization extension"
   homepage "https://www.php.net/manual/en/book.intl.php"
-  url "https://www.php.net/distributions/php-8.4.15.tar.xz"
-  mirror "https://fossies.org/linux/www/php-8.4.15.tar.xz"
-  sha256 "a060684f614b8344f9b34c334b6ba8db1177555997edb5b1aceab0a4b807da7e"
+  url "https://www.php.net/distributions/php-8.5.0.tar.xz"
+  mirror "https://fossies.org/linux/www/php-8.5.0.tar.xz"
+  sha256 "39cb6e4acd679b574d3d3276f148213e935fc25f90403eb84fb1b836a806ef1e"
   license "PHP-3.01"
   head "https://github.com/php/php-src.git", branch: "master"
 
